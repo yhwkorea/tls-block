@@ -86,13 +86,16 @@ string parse_sni(const uint8_t* data, size_t len) {
     pos += 4;
     if (pos + hs_len > len) return "";
 
-    pos += 2 + 32;
+    pos += 2 + 32; // version + random
     uint8_t sid_len = data[pos++];
     pos += sid_len;
+
     uint16_t cs_len = (data[pos] << 8) | data[pos+1];
     pos += 2 + cs_len;
+
     uint8_t comp_len = data[pos++];
     pos += comp_len;
+
     uint16_t ext_total = (data[pos] << 8) | data[pos+1];
     pos += 2;
     size_t end_ext = pos + ext_total;
@@ -102,9 +105,8 @@ string parse_sni(const uint8_t* data, size_t len) {
         uint16_t ext_len  = (data[pos+2] << 8) | data[pos+3];
         pos += 4;
         if (ext_type == 0x0000 && pos + ext_len <= end_ext) {
-            uint16_t list_len = (data[pos] << 8) | data[pos+1];
-            pos += 2;
-            pos++; // skip name_type
+            pos += 2; // skip list length
+            pos += 1; // skip name_type
             uint16_t name_len = (data[pos] << 8) | data[pos+1];
             pos += 2;
             return string((const char*)data + pos, name_len);
@@ -114,7 +116,7 @@ string parse_sni(const uint8_t* data, size_t len) {
     return "";
 }
 
-struct Flow { in_addr src, dst; uint16_t sport, dport;  
+struct Flow { in_addr src, dst; uint16_t sport, dport;
     bool operator<(Flow const& o) const {
         if (src.s_addr != o.src.s_addr) return src.s_addr < o.src.s_addr;
         if (dst.s_addr != o.dst.s_addr) return dst.s_addr < o.dst.s_addr;
@@ -122,6 +124,7 @@ struct Flow { in_addr src, dst; uint16_t sport, dport;
         return dport < o.dport;
     }
 };
+
 struct Reassembly { uint32_t base_seq{}; vector<uint8_t> buf; size_t expected{}; bool got_length{}; };
 
 int main(int argc, char* argv[]) {
@@ -135,8 +138,10 @@ int main(int argc, char* argv[]) {
 
     map<Flow, Reassembly> flows;
     while (true) {
-        struct pcap_pkthdr* hdr; const u_char* pkt;
+        struct pcap_pkthdr* hdr;
+        const u_char* pkt;
         if (pcap_next_ex(handle, &hdr, &pkt) <= 0) continue;
+
         const ip* iph = (ip*)(pkt + 14);
         if (iph->ip_p != IPPROTO_TCP) continue;
         int ip_len = iph->ip_hl * 4;
@@ -154,40 +159,51 @@ int main(int argc, char* argv[]) {
             string sni = parse_sni(data, data_len);
             if (!sni.empty() && sni.find(pattern) != string::npos) {
                 send_rst(iph, tcph);
-                ip iph_rev = *iph; tcphdr tcph_rev = *tcph;
-                iph_rev.ip_src = iph->ip_dst; iph_rev.ip_dst = iph->ip_src;
-                tcph_rev.th_sport = tcph->th_dport; tcph_rev.th_dport = tcph->th_sport;
+                ip iph_rev = *iph;
+                tcphdr tcph_rev = *tcph;
+                iph_rev.ip_src = iph->ip_dst;
+                iph_rev.ip_dst = iph->ip_src;
+                tcph_rev.th_sport = tcph->th_dport;
+                tcph_rev.th_dport = tcph->th_sport;
                 tcph_rev.th_seq = tcph->th_ack;
                 tcph_rev.th_ack = htonl(ntohl(tcph->th_seq) + data_len);
                 send_rst(&iph_rev, &tcph_rev);
                 cout << "[+] TLS-blocked " << sni << "\n";
             } else if (data_len >= 5 && data[0] == 0x16) {
-                uint16_t rec_len = (data[3]<<8)|data[4];
-                r.base_seq = seq; r.expected = 5 + rec_len; r.got_length = true;
-                r(buf.insert(r.buf.end(), data, data + data_len));
+                uint16_t rec_len = (data[3] << 8) | data[4];
+                r.base_seq = seq;
+                r.expected = (size_t)5 + rec_len;
+                r.got_length = true;
+                r.buf.insert(r.buf.end(), data, data + data_len);
             }
         } else {
             if (seq == r.base_seq + r.buf.size()) {
                 r.buf.insert(r.buf.end(), data, data + data_len);
                 if (!r.got_length && r.buf.size() >= 5) {
-                    uint16_t rec_len = (r(buf[3]<<8)|r(buf[4]));
-                    r.expected = 5 + rec_len; r.got_length = true;
+                    uint16_t rec_len = (r.buf[3] << 8) | r.buf[4];
+                    r.expected = (size_t)5 + rec_len;
+                    r.got_length = true;
                 }
                 if (r.got_length && r.buf.size() >= r.expected) {
                     string sni = parse_sni(r.buf.data(), r.buf.size());
                     flows.erase(f);
                     if (sni.find(pattern) != string::npos) {
                         send_rst(iph, tcph);
-                        ip iph_rev = *iph; tcphdr tcph_rev = *tcph;
-                        iph_rev.ip_src = iph->ip_dst; iph_rev.ip_dst = iph->ip_src;
-                        tcph_rev.th_sport = tcph->th_dport; tcph_rev.th_dport = tcph->th_sport;
+                        ip iph_rev = *iph;
+                        tcphdr tcph_rev = *tcph;
+                        iph_rev.ip_src = iph->ip_dst;
+                        iph_rev.ip_dst = iph->ip_src;
+                        tcph_rev.th_sport = tcph->th_dport;
+                        tcph_rev.th_dport = tcph->th_sport;
                         tcph_rev.th_seq = tcph->th_ack;
                         tcph_rev.th_ack = htonl(ntohl(tcph->th_seq) + data_len);
                         send_rst(&iph_rev, &tcph_rev);
                         cout << "[+] TLS-blocked " << sni << "\n";
                     }
                 }
-            } else flows.erase(f);
+            } else {
+                flows.erase(f);
+            }
         }
     }
     pcap_close(handle);
