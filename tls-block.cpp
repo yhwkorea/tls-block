@@ -11,7 +11,7 @@
 
 using namespace std;
 
-// Simple 5-byte IP checksum
+// Simple IP checksum calculation
 uint16_t checksum(uint16_t* buf, int len) {
     uint32_t sum = 0;
     while (len > 1) {
@@ -24,7 +24,7 @@ uint16_t checksum(uint16_t* buf, int len) {
     return ~sum;
 }
 
-// Raw send using IP_HDRINCL
+// Send raw packet with IP_HDRINCL
 void send_packet(const char* packet, int size, const in_addr& dst_ip) {
     int sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (sock < 0) { perror("socket"); return; }
@@ -37,27 +37,24 @@ void send_packet(const char* packet, int size, const in_addr& dst_ip) {
     close(sock);
 }
 
-// Send a single RST packet (with ACK) for the given headers
+// Send RST packet with ACK flag
 void send_rst(const ip* ip_hdr, const tcphdr* tcp_hdr) {
     char buffer[1500] = {};
     ip* iph = (ip*)buffer;
     tcphdr* tcph = (tcphdr*)(buffer + sizeof(ip));
 
-    // Copy and swap headers
     *iph = *ip_hdr;
     iph->ip_len = htons(sizeof(ip) + sizeof(tcphdr));
     iph->ip_sum = 0;
     iph->ip_sum = checksum((uint16_t*)iph, sizeof(ip));
 
     *tcph = *tcp_hdr;
-    // Sequence and ack: reset sequence next
     tcph->th_seq = htonl(ntohl(tcp_hdr->th_seq) + 1);
     tcph->th_ack = htonl(ntohl(tcp_hdr->th_ack));
     tcph->th_flags = TH_RST | TH_ACK;
     tcph->th_off = sizeof(tcphdr) / 4;
     tcph->th_sum = 0;
 
-    // Pseudo-header for checksum
     struct {
         uint32_t src, dst;
         uint8_t zero, proto;
@@ -79,46 +76,45 @@ void send_rst(const ip* ip_hdr, const tcphdr* tcp_hdr) {
 
 // Parse SNI from a complete TLS ClientHello record
 string parse_sni(const uint8_t* data, size_t len) {
-    if (len < 5 || data[0] != 0x16) return ""; // Not a handshake
+    if (len < 5 || data[0] != 0x16) return "";                  // Not TLS handshake
     uint16_t rec_len = (data[3] << 8) | data[4];
-    if (len < 5 + rec_len) return "";
+    if (len < (size_t)5 + rec_len) return "";                   // Ensure full record
     size_t pos = 5;
     if (pos + 4 > len) return "";
-    if (data[pos] != 0x01) return ""; // Not ClientHello
+    if (data[pos] != 0x01) return "";                          // Not ClientHello
     uint32_t hs_len = ((data[pos+1] << 16) | (data[pos+2] << 8) | data[pos+3]);
     pos += 4;
     if (pos + hs_len > len) return "";
-    // Skip: version(2), random(32)
-    pos += 2 + 32;
-    // Session ID
+
+    pos += 2 + 32;                                               // Skip version + random
     if (pos + 1 > len) return "";
-    uint8_t sid_len = data[pos++];
+    uint8_t sid_len = data[pos++];                               // Session ID length
     pos += sid_len;
-    // Cipher suites
+
     if (pos + 2 > len) return "";
-    uint16_t cs_len = (data[pos] << 8) | data[pos+1];
+    uint16_t cs_len = (data[pos] << 8) | data[pos+1];           // Cipher suites length
     pos += 2 + cs_len;
-    // Compression methods
+
     if (pos + 1 > len) return "";
-    uint8_t comp_len = data[pos++];
+    uint8_t comp_len = data[pos++];                             // Compression methods length
     pos += comp_len;
-    // Extensions
+
     if (pos + 2 > len) return "";
-    uint16_t ext_total = (data[pos] << 8) | data[pos+1];
+    uint16_t ext_total = (data[pos] << 8) | data[pos+1];        // Extensions total length
     pos += 2;
     size_t end_ext = pos + ext_total;
+
     while (pos + 4 <= end_ext) {
         uint16_t ext_type = (data[pos] << 8) | data[pos+1];
         uint16_t ext_len  = (data[pos+2] << 8) | data[pos+3];
         pos += 4;
         if (ext_type == 0x0000 && pos + ext_len <= end_ext) {
-            // SNI list
             uint16_t list_len = (data[pos] << 8) | data[pos+1];
             pos += 2;
             if (pos + list_len <= end_ext) {
-                uint8_t name_type = data[pos];
-                uint16_t name_len = (data[pos+1] << 8) | data[pos+2];
-                pos += 3;
+                pos++;                                              // Skip name_type
+                uint16_t name_len = (data[pos] << 8) | data[pos+1];
+                pos += 2;
                 if (pos + name_len <= end_ext)
                     return string((const char*)data + pos, name_len);
             }
@@ -129,9 +125,8 @@ string parse_sni(const uint8_t* data, size_t len) {
     return "";
 }
 
-// Flow key for reassembly
 struct Flow {
-    in_addr src; in_addr dst;
+    in_addr src, dst;
     uint16_t sport, dport;
     bool operator<(Flow const& o) const {
         if (src.s_addr != o.src.s_addr) return src.s_addr < o.src.s_addr;
@@ -178,41 +173,32 @@ int main(int argc, char* argv[]) {
         auto& r = flows[f];
         uint32_t seq = ntohl(tcph->th_seq);
 
-        // Reassembly logic
         if (r.buf.empty()) {
-            // Starting new flow
             string sni = parse_sni(data, data_len);
             if (!sni.empty()) {
                 if (sni == target_sni) {
-                    // Block immediately
                     send_rst(iph, tcph);
-                    // reverse direction
-                    ip iph_rev = *iph;
-                    tcphdr tcph_rev = *tcph;
-                    iph_rev.ip_src = iph->ip_dst;
-                    iph_rev.ip_dst = iph->ip_src;
-                    tcph_rev.th_sport = tcph->th_dport;
-                    tcph_rev.th_dport = tcph->th_sport;
+                    ip iph_rev = *iph; tcphdr tcph_rev = *tcph;
+                    iph_rev.ip_src = iph->ip_dst; iph_rev.ip_dst = iph->ip_src;
+                    tcph_rev.th_sport = tcph->th_dport; tcph_rev.th_dport = tcph->th_sport;
                     tcph_rev.th_seq = tcph->th_ack;
                     tcph_rev.th_ack = htonl(ntohl(tcph->th_seq) + data_len);
                     send_rst(&iph_rev, &tcph_rev);
                     cout << "[+] TLS-blocked " << sni << "\n";
                 }
             } else if (data_len >= 5 && data[0] == 0x16) {
-                // incomplete: start buffer
                 uint16_t rec_len = (data[3]<<8)|data[4];
                 r.base_seq = seq;
-                r.expected = 5 + rec_len;
+                r.expected = (size_t)5 + rec_len;
                 r.got_length = true;
                 r.buf.insert(r.buf.end(), data, data + data_len);
             }
         } else {
-            // continue reassembly
             if (seq == r.base_seq + r.buf.size()) {
                 r.buf.insert(r.buf.end(), data, data + data_len);
                 if (!r.got_length && r.buf.size() >= 5) {
                     uint16_t rec_len = (r.buf[3]<<8)|r.buf[4];
-                    r.expected = 5 + rec_len;
+                    r.expected = (size_t)5 + rec_len;
                     r.got_length = true;
                 }
                 if (r.got_length && r.buf.size() >= r.expected) {
@@ -220,12 +206,9 @@ int main(int argc, char* argv[]) {
                     flows.erase(f);
                     if (sni == target_sni) {
                         send_rst(iph, tcph);
-                        ip iph_rev = *iph;
-                        tcphdr tcph_rev = *tcph;
-                        iph_rev.ip_src = iph->ip_dst;
-                        iph_rev.ip_dst = iph->ip_src;
-                        tcph_rev.th_sport = tcph->th_dport;
-                        tcph_rev.th_dport = tcph->th_sport;
+                        ip iph_rev = *iph; tcphdr tcph_rev = *tcph;
+                        iph_rev.ip_src = iph->ip_dst; iph_rev.ip_dst = iph->ip_src;
+                        tcph_rev.th_sport = tcph->th_dport; tcph_rev.th_dport = tcph->th_sport;
                         tcph_rev.th_seq = tcph->th_ack;
                         tcph_rev.th_ack = htonl(ntohl(tcph->th_seq) + data_len);
                         send_rst(&iph_rev, &tcph_rev);
@@ -233,7 +216,6 @@ int main(int argc, char* argv[]) {
                     }
                 }
             } else {
-                // out-of-order: drop buffer
                 flows.erase(f);
             }
         }
