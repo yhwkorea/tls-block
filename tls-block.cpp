@@ -28,8 +28,7 @@ void send_packet(const char* packet, int size, const in_addr& dst_ip, const char
     if (sock < 0) { perror("socket"); return; }
     int one = 1;
     setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
-    // bind to interface
-    setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE, dev, strlen(dev));
+    
     struct sockaddr_in dst{};
     dst.sin_family = AF_INET;
     dst.sin_addr = dst_ip;
@@ -52,8 +51,8 @@ void send_rst(const struct iphdr* ip_hdr, const struct tcphdr* tcp_hdr, int data
 
     struct tcphdr* tcph = (struct tcphdr*)(pkt.data() + ip_len);
     // use original ack as RST sequence, keep ack unchanged
-    tcph->th_seq   = tcp_hdr->th_ack;
-    tcph->th_ack   = tcp_hdr->th_ack;
+    tcph->th_seq = tcp_hdr->ack_seq; // use original ack_seq as sequence
+    tcph->ack_seq = tcp_hdr->ack_seq; // preserve original ack_seq
     tcph->th_flags = TH_RST | TH_ACK;
     tcph->th_off   = tcp_len / 4;
     tcph->th_sum   = 0;
