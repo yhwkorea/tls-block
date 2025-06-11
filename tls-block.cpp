@@ -8,10 +8,8 @@
 #include <vector>
 #include <map>
 #include <string>
-
 using namespace std;
 
-// 16-bit checksum helper
 typedef unsigned short u16;
 u16 checksum(u16* buf, int len) {
     unsigned long sum = 0;
@@ -22,12 +20,10 @@ u16 checksum(u16* buf, int len) {
     return (u16)(~sum);
 }
 
-// Send raw packet bound to specific interface
-typedef struct iphdr iphdr;
 void send_packet(const char* packet, int size, const in_addr& dst_ip, const char* dev) {
     int sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (sock < 0) { perror("socket"); return; }
-        int one = 1;
+    int one = 1;
     setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
     sockaddr_in dst{};
     dst.sin_family = AF_INET;
@@ -36,32 +32,27 @@ void send_packet(const char* packet, int size, const in_addr& dst_ip, const char
     close(sock);
 }
 
-// Inject RST|ACK (proper SEQ/ACK and full TCP header copy)
 void send_rst(const iphdr* ip_hdr, const tcphdr* tcp_hdr, int data_len, const char* dev) {
-    char buf[1500] = {};
     int ip_len = sizeof(iphdr);
     int tcp_len = tcp_hdr->th_off * 4;
+    vector<uint8_t> pkt(ip_len + tcp_len);
+    memcpy(pkt.data(), ip_hdr, ip_len);
+    memcpy(pkt.data() + ip_len, tcp_hdr, tcp_len);
 
-    // Copy IP header
-    iphdr* iph = (iphdr*)buf;
-    memcpy(iph, ip_hdr, ip_len);
+    iphdr* iph = (iphdr*)pkt.data();
     iph->tot_len = htons(ip_len + tcp_len);
     iph->check = 0;
     iph->check = checksum((u16*)iph, ip_len);
 
-    // Copy TCP header + options
-    tcphdr* tcph = (tcphdr*)(buf + ip_len);
-    memcpy(tcph, tcp_hdr, tcp_len);
+    tcphdr* tcph = (tcphdr*)(pkt.data() + ip_len);
     uint32_t orig_seq = ntohl(tcp_hdr->th_seq);
     uint32_t orig_ack = ntohl(tcp_hdr->th_ack);
-    // Set RST sequence/ack according to RFC 793
-    tcph->th_seq   = htonl(orig_ack);
-    tcph->th_ack   = htonl(orig_seq + data_len);
-    tcph->th_flags = TH_RST | TH_ACK;
+    tcph->seq     = htonl(orig_ack);
+    tcph->ack_seq = htonl(orig_seq + data_len);
+    tcph->th_flags = TH_RST;
     tcph->th_off   = tcp_len / 4;
     tcph->th_sum   = 0;
 
-    // Build pseudo-header for checksum
     struct {
         uint32_t src, dst;
         uint8_t zero, proto;
@@ -73,18 +64,15 @@ void send_rst(const iphdr* ip_hdr, const tcphdr* tcp_hdr, int data_len, const ch
     pseudo.proto = IPPROTO_TCP;
     pseudo.len   = htons(tcp_len);
 
-    char tmp[1500] = {};
-    memcpy(tmp, &pseudo, sizeof(pseudo));
-    memcpy(tmp + sizeof(pseudo), tcph, tcp_len);
-    tcph->th_sum = checksum((u16*)tmp, sizeof(pseudo) + tcp_len);
+    vector<uint8_t> buf(pseudo.len + tcp_len);
+    memcpy(buf.data(), &pseudo, sizeof(pseudo));
+    memcpy(buf.data() + sizeof(pseudo), tcph, tcp_len);
+    tcph->th_sum = checksum((u16*)buf.data(), buf.size());
 
-    // Send packet bound to interface
-    in_addr dst_ip{};
-    dst_ip.s_addr = iph->daddr;
-    send_packet(buf, ip_len + tcp_len, dst_ip, dev);
+    in_addr dst_ip{.s_addr = iph->daddr};
+    send_packet((char*)pkt.data(), pkt.size(), dst_ip, dev);
 }
 
-// Extract SNI from TLS ClientHello
 string parse_sni(const uint8_t* data, size_t len) {
     if (len < 5 || data[0] != 0x16) return "";
     uint16_t rec_len = (data[3] << 8) | data[4];
@@ -95,9 +83,9 @@ string parse_sni(const uint8_t* data, size_t len) {
     pos += 4;
     if (pos + hs_len > len) return "";
     pos += 2 + 32;
-    uint8_t sid_len = data[pos++]; pos += sid_len;
-    uint16_t cs_len = (data[pos] << 8) | data[pos+1]; pos += 2 + cs_len;
-    uint8_t comp_len = data[pos++]; pos += comp_len;
+    uint8_t sid = data[pos++]; pos += sid;
+    uint16_t cs = (data[pos] << 8) | data[pos+1]; pos += 2 + cs;
+    uint8_t cl = data[pos++]; pos += cl;
     uint16_t ext_total = (data[pos] << 8) | data[pos+1]; pos += 2;
     size_t end_ext = pos + ext_total;
     while (pos + 4 <= end_ext) {
@@ -105,8 +93,8 @@ string parse_sni(const uint8_t* data, size_t len) {
         uint16_t l = (data[pos+2] << 8) | data[pos+3]; pos += 4;
         if (t == 0 && pos + l <= end_ext) {
             pos += 2; pos += 1;
-            uint16_t name_len = (data[pos] << 8) | data[pos+1]; pos += 2;
-            return string((char*)(data + pos), name_len);
+            uint16_t nl = (data[pos] << 8) | data[pos+1]; pos += 2;
+            return string((char*)(data + pos), nl);
         }
         pos += l;
     }
@@ -124,17 +112,18 @@ struct Flow { in_addr src, dst; uint16_t sport, dport;
 struct Reassembly { uint32_t base_seq{}; vector<uint8_t> buf; size_t expected{}; bool got_len{}; };
 
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        cerr << "syntax: tls-block <interface> <pattern>\n";
-        return -1;
-    }
+    if (argc != 3) { cerr << "syntax: tls-block <interface> <pattern>\n"; return -1; }
     char* dev = argv[1];
     string pattern = argv[2];
 
     char err[PCAP_ERRBUF_SIZE];
-    pcap_t* handle = pcap_open_live(dev, BUFSIZ, 1, -1, err);
+    pcap_t* handle = pcap_open_live(dev, 65535, 1, -1, err);
     if (!handle) { cerr << err << endl; return -1; }
     pcap_set_immediate_mode(handle, 1);
+    struct bpf_program fp;
+    if (pcap_compile(handle, &fp, "tcp port 443", 1, PCAP_NETMASK_UNKNOWN) == 0) {
+        pcap_setfilter(handle, &fp);
+    }
 
     map<Flow, Reassembly> flows;
     while (true) {
@@ -155,20 +144,7 @@ int main(int argc, char* argv[]) {
         uint32_t seq = ntohl(tcph->seq);
 
         if (r.buf.empty()) {
-            string sni = parse_sni(data, dlen);
-            if (!sni.empty() && sni.find(pattern) != string::npos) {
-                send_rst(iph, tcph, dlen, dev);
-                iphdr rev_iph = *iph;
-                tcphdr rev_tcph = *tcph;
-                rev_iph.saddr = iph->daddr;
-                rev_iph.daddr = iph->saddr;
-                rev_tcph.source = tcph->dest;
-                rev_tcph.dest = tcph->source;
-                rev_tcph.seq = tcph->ack_seq;
-                rev_tcph.ack_seq = htonl(ntohl(tcph->seq) + dlen);
-                send_rst(&rev_iph, &rev_tcph, dlen, dev);
-                cout << "[+] TLS-blocked " << sni << endl;
-            } else if (dlen >= 5 && data[0] == 0x16) {
+            if (dlen >= 5 && data[0] == 0x16) {
                 uint16_t rec = (data[3] << 8) | data[4];
                 r.base_seq = seq;
                 r.expected = 5 + rec;
@@ -178,25 +154,20 @@ int main(int argc, char* argv[]) {
         } else {
             if (seq == r.base_seq + r.buf.size()) {
                 r.buf.insert(r.buf.end(), data, data + dlen);
-                if (!r.got_len && r.buf.size() >= 5) {
-                    uint16_t rec = (r.buf[3] << 8) | r.buf[4];
-                    r.expected = 5 + rec;
-                    r.got_len = true;
-                }
                 if (r.got_len && r.buf.size() >= r.expected) {
                     string sni = parse_sni(r.buf.data(), r.buf.size());
-                    flows.erase(f);
-                    if (sni.find(pattern) != string::npos) {
-                        send_rst(iph, tcph, dlen, dev);
+                    r.buf.clear(); r.got_len = false;
+                    if (!sni.empty() && sni.find(pattern) != string::npos) {
+                        send_rst(iph, tcph, r.expected, dev);
                         iphdr rev_iph = *iph;
                         tcphdr rev_tcph = *tcph;
                         rev_iph.saddr = iph->daddr;
                         rev_iph.daddr = iph->saddr;
-                        rev_tcph.source = tcph->dest;
-                        rev_tcph.dest = tcph->source;
+                        rev_tcph.source = tcp_hdr->dest;
+                        rev_tcph.dest = tcp_hdr->source;
                         rev_tcph.seq = tcph->ack_seq;
-                        rev_tcph.ack_seq = htonl(ntohl(tcph->seq) + dlen);
-                        send_rst(&rev_iph, &rev_tcph, dlen, dev);
+                        rev_tcph.ack_seq = htonl(ntohl(tcph->seq) + r.expected);
+                        send_rst(&rev_iph, &rev_tcph, r.expected, dev);
                         cout << "[+] TLS-blocked " << sni << endl;
                     }
                 }
