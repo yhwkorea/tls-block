@@ -170,12 +170,12 @@ int main(int argc,char*argv[]){
         if(!r.got){ if(dlen>=5&&data[0]==0x16){ uint16_t rec=(data[3]<<8)|data[4]; r.base_seq=seq; r.expected=5+rec; r.got=true; r.buf.insert(r.buf.end(),data,data+dlen);} }
         else{ if(seq==r.base_seq+r.buf.size()){ r.buf.insert(r.buf.end(),data,data+dlen); if(r.buf.size()>=r.expected){ string sni=parse_sni(r.buf.data(),r.buf.size()); r.buf.clear(); r.got=false; if(!sni.empty() && sni.find(pat)!=string::npos){ // find MAC
                         ether_header* reth = (ether_header*)p; uint8_t mac[6]; memcpy(mac, reth->ether_shost, 6);
-                        send_rst(iph,tcph,r.expected,dev); // send both sides
+                        inject_rst_to_server(handle, pkt, iph, tcph, r.expected, mac); // send both sides
                         iphdr rip=*iph; tcphdr rtc=*tcph;
                         rip.saddr=iph->daddr; rip.daddr=iph->saddr;
                         rtc.source=tcph->dest; rtc.dest=tcph->source;
                         rtc.seq=tcph->ack_seq; rtc.ack_seq=htonl(ntohl(tcph->seq)+r.expected);
-                        send_rst(&rip,&rtc,r.expected,dev);
+                        inject_rst_to_client(&rip, &rtc, r.expected);
                         cout<<"[+] TLS-blocked "<<sni<<"\n"; } } } else flows.erase(f);} }
     pcap_close(handle);
     return 0;
