@@ -22,10 +22,14 @@ u16 checksum(u16* buf, int len) {
     return (u16)(~sum);
 }
 
-// Send raw packet with IP_HDRINCL
-void send_packet(const char* packet, int size, const in_addr& dst_ip) {
+// Send raw packet on specific interface
+void send_packet(const char* packet, int size, const in_addr& dst_ip, const char* dev) {
     int sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (sock < 0) { perror("socket"); return; }
+    // Bind to device
+    if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE, dev, strlen(dev)) < 0) {
+        perror("SO_BINDTODEVICE");
+    }
     int one = 1;
     setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
     sockaddr_in dst{};
@@ -35,27 +39,27 @@ void send_packet(const char* packet, int size, const in_addr& dst_ip) {
     close(sock);
 }
 
-// Send RST|ACK packet; data_len is length of captured payload
-void send_rst(const ip* ip_hdr, const tcphdr* tcp_hdr, int data_len) {
+// Inject RST|ACK packet
+void send_rst(const ip* ip_hdr, const tcphdr* tcp_hdr, int data_len, const char* dev) {
     char buf[1500] = {};
     ip* iph = (ip*)buf;
     tcphdr* tcph = (tcphdr*)(buf + sizeof(ip));
 
-    // Copy original IP
     *iph = *ip_hdr;
     iph->ip_len = htons(sizeof(ip) + sizeof(tcphdr));
     iph->ip_sum = 0;
     iph->ip_sum = checksum((u16*)iph, sizeof(ip));
 
-    // Build TCP RST|ACK
     *tcph = *tcp_hdr;
+    // seq = original seq + payload length
     tcph->th_seq   = htonl(ntohl(tcp_hdr->th_seq) + data_len);
-    tcph->th_ack   = htonl(ntohl(tcp_hdr->th_ack) + data_len);
+    // ack = original ack (no change)
+    tcph->th_ack   = tcp_hdr->th_ack;
     tcph->th_flags = TH_RST | TH_ACK;
     tcph->th_off   = sizeof(tcphdr)/4;
     tcph->th_sum   = 0;
 
-    // Pseudo-header checksum
+    // pseudo-header for checksum
     struct {
         uint32_t src, dst;
         uint8_t zero, proto;
@@ -72,39 +76,35 @@ void send_rst(const ip* ip_hdr, const tcphdr* tcp_hdr, int data_len) {
     memcpy(tmp + sizeof(pseudo), tcph, sizeof(tcphdr));
     tcph->th_sum = checksum((u16*)tmp, sizeof(pseudo) + sizeof(tcphdr));
 
-    // Send via raw socket
-    send_packet(buf, sizeof(ip) + sizeof(tcphdr), iph->ip_dst);
+    send_packet(buf, sizeof(ip) + sizeof(tcphdr), iph->ip_dst, dev);
 }
 
 // Parse SNI from TLS ClientHello
 string parse_sni(const uint8_t* data, size_t len) {
     if (len < 5 || data[0] != 0x16) return "";
-    uint16_t rec_len = (data[3] << 8) | data[4];
+    uint16_t rec_len = (data[3]<<8) | data[4];
     if (len < 5 + rec_len) return "";
     size_t pos = 5;
-    if (pos + 4 > len || data[pos] != 0x01) return "";
-    uint32_t hs_len = (data[pos+1] << 16) | (data[pos+2] << 8) | data[pos+3];
+    if (pos+4 > len || data[pos] != 0x01) return "";
+    uint32_t hs_len = (data[pos+1]<<16) | (data[pos+2]<<8) | data[pos+3];
     pos += 4;
     if (pos + hs_len > len) return "";
-
-    pos += 2 + 32; // version + random
+    pos += 2 + 32;
     uint8_t sid_len = data[pos++]; pos += sid_len;
-    uint16_t cs_len = (data[pos] << 8) | data[pos+1]; pos += 2 + cs_len;
+    uint16_t cs_len = (data[pos]<<8) | data[pos+1]; pos += 2 + cs_len;
     uint8_t comp_len = data[pos++]; pos += comp_len;
-    uint16_t ext_total = (data[pos] << 8) | data[pos+1]; pos += 2;
-    size_t end_ext = pos + ext_total;
-
+    uint16_t ext_len = (data[pos]<<8) | data[pos+1]; pos += 2;
+    size_t end_ext = pos + ext_len;
     while (pos + 4 <= end_ext) {
-        uint16_t ext_type = (data[pos] << 8) | data[pos+1];
-        uint16_t ext_len  = (data[pos+2] << 8) | data[pos+3];
-        pos += 4;
-        if (ext_type == 0x0000 && pos + ext_len <= end_ext) {
+        uint16_t t = (data[pos]<<8) | data[pos+1];
+        uint16_t l = (data[pos+2]<<8) | data[pos+3]; pos += 4;
+        if (t == 0 && pos + l <= end_ext) {
             pos += 2; // list length
             pos += 1; // name_type
-            uint16_t name_len = (data[pos] << 8) | data[pos+1]; pos += 2;
-            return string((char*)(data + pos), name_len);
+            uint16_t nl = (data[pos]<<8) | data[pos+1]; pos += 2;
+            return string((char*)(data + pos), nl);
         }
-        pos += ext_len;
+        pos += l;
     }
     return "";
 }
@@ -130,8 +130,7 @@ int main(int argc, char* argv[]) {
 
     map<Flow, Reassembly> flows;
     while (true) {
-        struct pcap_pkthdr* hdr;
-        const u_char* pkt;
+        pcap_pkthdr* hdr; const u_char* pkt;
         if (pcap_next_ex(h, &hdr, &pkt) <= 0) continue;
         ip* iph = (ip*)(pkt + 14);
         if (iph->ip_p != IPPROTO_TCP) continue;
@@ -149,10 +148,7 @@ int main(int argc, char* argv[]) {
         if (r.buf.empty()) {
             string sni = parse_sni(data, dlen);
             if (!sni.empty() && sni.find(pat) != string::npos) {
-                // Send RST to server
-                send_rst(iph, tcph, dlen);
-
-                // Build reversed headers for client
+                send_rst(iph, tcph, dlen, dev);
                 ip iph_rev = *iph;
                 tcphdr tcph_rev = *tcph;
                 iph_rev.ip_src = iph->ip_dst;
@@ -161,12 +157,10 @@ int main(int argc, char* argv[]) {
                 tcph_rev.th_dport = tcph->th_sport;
                 tcph_rev.th_seq = tcph->th_ack;
                 tcph_rev.th_ack = htonl(ntohl(tcph->th_seq) + dlen);
-
-                // Send RST to client
-                send_rst(&iph_rev, &tcph_rev, dlen);
+                send_rst(&iph_rev, &tcph_rev, dlen, dev);
                 cout << "[+] TLS-blocked " << sni << "\n";
             } else if (dlen >= 5 && data[0] == 0x16) {
-                uint16_t rec = (data[3] << 8) | data[4];
+                uint16_t rec = (data[3]<<8) | data[4];
                 r.base_seq = seq;
                 r.expected = 5 + rec;
                 r.got_len = true;
@@ -176,7 +170,7 @@ int main(int argc, char* argv[]) {
             if (seq == r.base_seq + r.buf.size()) {
                 r.buf.insert(r.buf.end(), data, data + dlen);
                 if (!r.got_len && r.buf.size() >= 5) {
-                    uint16_t rec = (r.buf[3] << 8) | r.buf[4];
+                    uint16_t rec = (r.buf[3]<<8) | r.buf[4];
                     r.expected = 5 + rec;
                     r.got_len = true;
                 }
@@ -184,7 +178,7 @@ int main(int argc, char* argv[]) {
                     string sni = parse_sni(r.buf.data(), r.buf.size());
                     flows.erase(f);
                     if (sni.find(pat) != string::npos) {
-                        send_rst(iph, tcph, dlen);
+                        send_rst(iph, tcph, dlen, dev);
                         ip iph_rev = *iph;
                         tcphdr tcph_rev = *tcph;
                         iph_rev.ip_src = iph->ip_dst;
@@ -193,7 +187,7 @@ int main(int argc, char* argv[]) {
                         tcph_rev.th_dport = tcph->th_sport;
                         tcph_rev.th_seq = tcph->th_ack;
                         tcph_rev.th_ack = htonl(ntohl(tcph->th_seq) + dlen);
-                        send_rst(&iph_rev, &tcph_rev, dlen);
+                        send_rst(&iph_rev, &tcph_rev, dlen, dev);
                         cout << "[+] TLS-blocked " << sni << "\n";
                     }
                 }
