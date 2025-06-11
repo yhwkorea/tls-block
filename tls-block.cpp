@@ -15,10 +15,6 @@
 using namespace std;
 
 typedef unsigned short u16;
-void usage() {
-    printf("syntax : tls-block <interface> <server_name>\n"); 
-    printf("sample : tls-block wlan0 naver.com\n"); 
-}
 static u16 checksum(u16* buf, int len) {
     unsigned long sum = 0;
     while (len > 1) { sum += *buf++; len -= 2; }
@@ -32,7 +28,7 @@ static u16 checksum(u16* buf, int len) {
 static string parse_sni(const uint8_t* data, size_t len) {
     if (len < 5 || data[0] != 0x16) return "";
     uint16_t rec_len = (data[3] << 8) | data[4];
-    if (len < 5 + rec_len) return "";
+    if (len < (size_t)5 + rec_len) return "";
     size_t pos = 5;
     if (pos + 4 > len || data[pos] != 0x01) return "";
     uint32_t hs_len = (data[pos+1]<<16)|(data[pos+2]<<8)|data[pos+3];
@@ -168,7 +164,7 @@ static void inject_backward_rst(const iphdr* iph_orig,
 }
 
 int main(int argc, char** argv) {
-    if (argc!=3) { usage(); return 1; }
+    if (argc!=3) { cerr<<"usage: tls-block <iface> <pattern>\n"; return 1; }
     char* dev=argv[1]; string pat=argv[2];
     char ebuf[PCAP_ERRBUF_SIZE];
     pcap_t* handle=pcap_open_live(dev,65535,1,1,ebuf);
@@ -192,7 +188,10 @@ int main(int argc, char** argv) {
         auto* iph=(iphdr*)(pkt+sizeof(ether_header)); if(iph->protocol!=IPPROTO_TCP) continue;
         int ip_len=iph->ihl*4; auto* tcph=(tcphdr*)(pkt+sizeof(ether_header)+ip_len);
         int tcp_len=tcph->th_off*4; int dlen=ntohs(iph->tot_len)-ip_len-tcp_len;
-        if(dlen<=0) continue; const uint8_t* data=(uint8_t*)tcph+tcp_len;
+        if (dlen <= 0) {
+            continue;
+        }
+        const uint8_t* data = (uint8_t*)tcph + tcp_len;
 
         FlowKey key{iph->saddr,iph->daddr,ntohs(tcph->source),ntohs(tcph->dest)};
         auto& r=flows[key]; uint32_t seq=ntohl(tcph->seq);
