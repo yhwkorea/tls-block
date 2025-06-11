@@ -74,33 +74,26 @@ void send_rst(const ip* ip_hdr, const tcphdr* tcp_hdr) {
     send_packet(buffer, sizeof(ip) + sizeof(tcphdr), iph->ip_dst);
 }
 
-// Parse SNI from a complete TLS ClientHello record
+// Parse SNI from TLS ClientHello
 string parse_sni(const uint8_t* data, size_t len) {
-    if (len < 5 || data[0] != 0x16) return "";                  // Not TLS handshake
+    if (len < 5 || data[0] != 0x16) return "";
     uint16_t rec_len = (data[3] << 8) | data[4];
-    if (len < (size_t)5 + rec_len) return "";                   // Ensure full record
+    if (len < (size_t)5 + rec_len) return "";
     size_t pos = 5;
     if (pos + 4 > len) return "";
-    if (data[pos] != 0x01) return "";                          // Not ClientHello
+    if (data[pos] != 0x01) return "";
     uint32_t hs_len = ((data[pos+1] << 16) | (data[pos+2] << 8) | data[pos+3]);
     pos += 4;
     if (pos + hs_len > len) return "";
 
-    pos += 2 + 32;                                               // Skip version + random
-    if (pos + 1 > len) return "";
-    uint8_t sid_len = data[pos++];                               // Session ID length
+    pos += 2 + 32;
+    uint8_t sid_len = data[pos++];
     pos += sid_len;
-
-    if (pos + 2 > len) return "";
-    uint16_t cs_len = (data[pos] << 8) | data[pos+1];           // Cipher suites length
+    uint16_t cs_len = (data[pos] << 8) | data[pos+1];
     pos += 2 + cs_len;
-
-    if (pos + 1 > len) return "";
-    uint8_t comp_len = data[pos++];                             // Compression methods length
+    uint8_t comp_len = data[pos++];
     pos += comp_len;
-
-    if (pos + 2 > len) return "";
-    uint16_t ext_total = (data[pos] << 8) | data[pos+1];        // Extensions total length
+    uint16_t ext_total = (data[pos] << 8) | data[pos+1];
     pos += 2;
     size_t end_ext = pos + ext_total;
 
@@ -111,23 +104,17 @@ string parse_sni(const uint8_t* data, size_t len) {
         if (ext_type == 0x0000 && pos + ext_len <= end_ext) {
             uint16_t list_len = (data[pos] << 8) | data[pos+1];
             pos += 2;
-            if (pos + list_len <= end_ext) {
-                pos++;                                              // Skip name_type
-                uint16_t name_len = (data[pos] << 8) | data[pos+1];
-                pos += 2;
-                if (pos + name_len <= end_ext)
-                    return string((const char*)data + pos, name_len);
-            }
-            break;
+            pos++; // skip name_type
+            uint16_t name_len = (data[pos] << 8) | data[pos+1];
+            pos += 2;
+            return string((const char*)data + pos, name_len);
         }
         pos += ext_len;
     }
     return "";
 }
 
-struct Flow {
-    in_addr src, dst;
-    uint16_t sport, dport;
+struct Flow { in_addr src, dst; uint16_t sport, dport;  
     bool operator<(Flow const& o) const {
         if (src.s_addr != o.src.s_addr) return src.s_addr < o.src.s_addr;
         if (dst.s_addr != o.dst.s_addr) return dst.s_addr < o.dst.s_addr;
@@ -135,37 +122,21 @@ struct Flow {
         return dport < o.dport;
     }
 };
-
-struct Reassembly {
-    uint32_t base_seq{};
-    vector<uint8_t> buf;
-    size_t expected{};
-    bool got_length{};
-};
+struct Reassembly { uint32_t base_seq{}; vector<uint8_t> buf; size_t expected{}; bool got_length{}; };
 
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        cerr << "syntax: tls-block <interface> <servername>\n";
-        return -1;
-    }
+    if (argc != 3) { cerr << "syntax: tls-block <interface> <pattern>\n"; return -1; }
     char* dev = argv[1];
-    string target_sni = argv[2];
+    string pattern = argv[2];
     char errbuf[PCAP_ERRBUF_SIZE];
-    // Use blocking read (-1 timeout) to capture all packets
     pcap_t* handle = pcap_open_live(dev, BUFSIZ, 1, -1, errbuf);
     if (!handle) { cerr << errbuf; return -1; }
     pcap_set_immediate_mode(handle, 1);
 
     map<Flow, Reassembly> flows;
-
     while (true) {
-        struct pcap_pkthdr* hdr;
-        const u_char* pkt;
-        int res = pcap_next_ex(handle, &hdr, &pkt);
-        if (res <= 0) continue;
-        // Debug: caught packet
-        fprintf(stderr, "[*] caught packet len=%u\n", hdr->len);
-
+        struct pcap_pkthdr* hdr; const u_char* pkt;
+        if (pcap_next_ex(handle, &hdr, &pkt) <= 0) continue;
         const ip* iph = (ip*)(pkt + 14);
         if (iph->ip_p != IPPROTO_TCP) continue;
         int ip_len = iph->ip_hl * 4;
@@ -173,54 +144,39 @@ int main(int argc, char* argv[]) {
         int tcp_len = tcph->th_off * 4;
         int data_len = ntohs(iph->ip_len) - ip_len - tcp_len;
         if (data_len <= 0) continue;
-        // Debug: TCP payload info
-        fprintf(stderr, "    [+] tcp payload len=%d, src=%s:%u dst=%s:%u\n",
-                data_len,
-                inet_ntoa(iph->ip_src), ntohs(tcph->th_sport),
-                inet_ntoa(iph->ip_dst), ntohs(tcph->th_dport));
-
         const uint8_t* data = pkt + 14 + ip_len + tcp_len;
-        if (data_len >= 5 && data[0] == 0x16)
-            fprintf(stderr, "    [+] TLS record detected\n");
 
-        Flow f{iph->ip_src, iph->ip_dst,
-               ntohs(tcph->th_sport), ntohs(tcph->th_dport)};
+        Flow f{iph->ip_src, iph->ip_dst, ntohs(tcph->th_sport), ntohs(tcph->th_dport)};
         auto& r = flows[f];
         uint32_t seq = ntohl(tcph->th_seq);
 
         if (r.buf.empty()) {
             string sni = parse_sni(data, data_len);
-            fprintf(stderr, "    [+] parse_sni() -> '%s'\n", sni.c_str());
-            if (!sni.empty()) {
-                if (sni == target_sni) {
-                    send_rst(iph, tcph);
-                    ip iph_rev = *iph; tcphdr tcph_rev = *tcph;
-                    iph_rev.ip_src = iph->ip_dst; iph_rev.ip_dst = iph->ip_src;
-                    tcph_rev.th_sport = tcph->th_dport; tcph_rev.th_dport = tcph->th_sport;
-                    tcph_rev.th_seq = tcph->th_ack;
-                    tcph_rev.th_ack = htonl(ntohl(tcph->th_seq) + data_len);
-                    send_rst(&iph_rev, &tcph_rev);
-                    cout << "[+] TLS-blocked " << sni << "\n";
-                }
+            if (!sni.empty() && sni.find(pattern) != string::npos) {
+                send_rst(iph, tcph);
+                ip iph_rev = *iph; tcphdr tcph_rev = *tcph;
+                iph_rev.ip_src = iph->ip_dst; iph_rev.ip_dst = iph->ip_src;
+                tcph_rev.th_sport = tcph->th_dport; tcph_rev.th_dport = tcph->th_sport;
+                tcph_rev.th_seq = tcph->th_ack;
+                tcph_rev.th_ack = htonl(ntohl(tcph->th_seq) + data_len);
+                send_rst(&iph_rev, &tcph_rev);
+                cout << "[+] TLS-blocked " << sni << "\n";
             } else if (data_len >= 5 && data[0] == 0x16) {
                 uint16_t rec_len = (data[3]<<8)|data[4];
-                r.base_seq = seq;
-                r.expected = (size_t)5 + rec_len;
-                r.got_length = true;
-                r.buf.insert(r.buf.end(), data, data + data_len);
+                r.base_seq = seq; r.expected = 5 + rec_len; r.got_length = true;
+                r(buf.insert(r.buf.end(), data, data + data_len));
             }
         } else {
             if (seq == r.base_seq + r.buf.size()) {
                 r.buf.insert(r.buf.end(), data, data + data_len);
                 if (!r.got_length && r.buf.size() >= 5) {
-                    uint16_t rec_len = (r.buf[3]<<8)|r.buf[4];
-                    r.expected = (size_t)5 + rec_len;
-                    r.got_length = true;
+                    uint16_t rec_len = (r(buf[3]<<8)|r(buf[4]));
+                    r.expected = 5 + rec_len; r.got_length = true;
                 }
                 if (r.got_length && r.buf.size() >= r.expected) {
                     string sni = parse_sni(r.buf.data(), r.buf.size());
                     flows.erase(f);
-                    if (sni == target_sni) {
+                    if (sni.find(pattern) != string::npos) {
                         send_rst(iph, tcph);
                         ip iph_rev = *iph; tcphdr tcph_rev = *tcph;
                         iph_rev.ip_src = iph->ip_dst; iph_rev.ip_dst = iph->ip_src;
@@ -231,9 +187,7 @@ int main(int argc, char* argv[]) {
                         cout << "[+] TLS-blocked " << sni << "\n";
                     }
                 }
-            } else {
-                flows.erase(f);
-            }
+            } else flows.erase(f);
         }
     }
     pcap_close(handle);
