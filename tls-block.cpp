@@ -59,7 +59,7 @@ static string parse_sni(const uint8_t* payload_data, size_t payload_len) {
     uint16_t ext_total = (payload_data[offset]<<8)|payload_data[offset+1];
     offset += 2;
     size_t end_of_ext = offset + ext_total;
-
+    // https://img1.daumcdn.net/thumb/R1280x0/?scode=mtistory2&fname=https%3A%2F%2Fblog.kakaocdn.net%2Fdn%2FI5TLu%2FbtrBRoSgSI2%2FVRgHO2rNOljLsP9IsAYwaK%2Fimg.jpg
     while (offset + 4 <= end_of_ext && offset + 4 <= payload_len) {
         uint16_t ext_type = (payload_data[offset]<<8)|payload_data[offset+1];
         uint16_t ext_len  = (payload_data[offset+2]<<8)|payload_data[offset+3];
