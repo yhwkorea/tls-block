@@ -10,6 +10,8 @@
 #include <vector>
 #include <map>
 #include <string>
+#include <sys/ioctl.h>
+#include <net/if.h>
 using namespace std;
 
 typedef unsigned short u16;
@@ -26,7 +28,7 @@ static u16 checksum(u16* buf, int len) {
 static string parse_sni(const uint8_t* data, size_t len) {
     if (len < 5 || data[0] != 0x16) return "";
     uint16_t rec_len = (data[3] << 8) | data[4];
-    if (len < 5 + rec_len) return "";
+    if (len < (size_t)5 + rec_len) return "";
     size_t pos = 5;
     // Handshake type should be ClientHello (0x01)
     if (data[pos] != 0x01) return "";
@@ -170,13 +172,13 @@ int main(int argc, char* argv[]) {
     while (true) {
         pcap_pkthdr* hdr; const u_char* pkt;
         if (pcap_next_ex(handle, &hdr, &pkt) <= 0) continue;
-        auto* eth = (ether_header*)pkt; if (ntohs(eth->ether_type)!=ETH_P_IP) continue;
+        auto* eth = (ether_header*)pkt; if (ntohs(eth->ether_type) != ETHERTYPE_IP) continue;
         auto* iph = (iphdr*)(pkt+sizeof(ether_header)); if (iph->protocol!=IPPROTO_TCP) continue;
         int ip_len = iph->ihl*4;
         auto* tcph = (tcphdr*)(pkt+sizeof(ether_header)+ip_len);
         int tcp_len = tcph->th_off*4;
         int dlen = ntohs(iph->tot_len)-ip_len-tcp_len; if (dlen<=0) continue;
-        const uint8_t* data = pkt+sizeof(ethernet_header)+ip_len+tcp_len;
+        const uint8_t* data = pkt + sizeof(struct ether_header)+ip_len+tcp_len;
 
         Flow f{iph->saddr, iph->daddr, ntohs(tcph->source), ntohs(tcph->dest)};
         auto& r = flows[f];
