@@ -151,8 +151,11 @@ int main(int argc, char* argv[]) {
     char* dev = argv[1];
     string target_sni = argv[2];
     char errbuf[PCAP_ERRBUF_SIZE];
-    pcap_t* handle = pcap_open_live(dev, BUFSIZ, 1, 1000, errbuf);
+    // Use blocking read (-1 timeout) to capture all packets
+    pcap_t* handle = pcap_open_live(dev, BUFSIZ, 1, -1, errbuf);
     if (!handle) { cerr << errbuf; return -1; }
+    pcap_set_immediate_mode(handle, 1);
+
     map<Flow, Reassembly> flows;
 
     while (true) {
@@ -160,6 +163,9 @@ int main(int argc, char* argv[]) {
         const u_char* pkt;
         int res = pcap_next_ex(handle, &hdr, &pkt);
         if (res <= 0) continue;
+        // Debug: caught packet
+        fprintf(stderr, "[*] caught packet len=%u\n", hdr->len);
+
         const ip* iph = (ip*)(pkt + 14);
         if (iph->ip_p != IPPROTO_TCP) continue;
         int ip_len = iph->ip_hl * 4;
@@ -167,14 +173,24 @@ int main(int argc, char* argv[]) {
         int tcp_len = tcph->th_off * 4;
         int data_len = ntohs(iph->ip_len) - ip_len - tcp_len;
         if (data_len <= 0) continue;
-        const uint8_t* data = pkt + 14 + ip_len + tcp_len;
+        // Debug: TCP payload info
+        fprintf(stderr, "    [+] tcp payload len=%d, src=%s:%u dst=%s:%u\n",
+                data_len,
+                inet_ntoa(iph->ip_src), ntohs(tcph->th_sport),
+                inet_ntoa(iph->ip_dst), ntohs(tcph->th_dport));
 
-        Flow f{iph->ip_src, iph->ip_dst, ntohs(tcph->th_sport), ntohs(tcph->th_dport)};
+        const uint8_t* data = pkt + 14 + ip_len + tcp_len;
+        if (data_len >= 5 && data[0] == 0x16)
+            fprintf(stderr, "    [+] TLS record detected\n");
+
+        Flow f{iph->ip_src, iph->ip_dst,
+               ntohs(tcph->th_sport), ntohs(tcph->th_dport)};
         auto& r = flows[f];
         uint32_t seq = ntohl(tcph->th_seq);
 
         if (r.buf.empty()) {
             string sni = parse_sni(data, data_len);
+            fprintf(stderr, "    [+] parse_sni() -> '%s'\n", sni.c_str());
             if (!sni.empty()) {
                 if (sni == target_sni) {
                     send_rst(iph, tcph);
