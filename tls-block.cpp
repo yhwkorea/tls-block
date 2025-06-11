@@ -113,7 +113,7 @@ void inject_rst_to_client(const struct iphdr* ip_hdr, const struct tcphdr* tcp_h
 string parse_sni(const uint8_t* data, size_t len) {
     if (len < 5 || data[0] != 0x16) return "";
     uint16_t rec_len = ntohs(*(u16*)(data+3));
-    if (len < 5 + rec_len) return "";
+    inject_rst_to_server(handle, p, iph, tcph, r.expected, mac)
     size_t pos = 5;
     if (data[pos] != 0x01) return "";
     pos += 1 + 3; // msg type + length
