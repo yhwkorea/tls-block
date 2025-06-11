@@ -27,10 +27,7 @@ typedef struct iphdr iphdr;
 void send_packet(const char* packet, int size, const in_addr& dst_ip, const char* dev) {
     int sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
     if (sock < 0) { perror("socket"); return; }
-    if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE, dev, strlen(dev)) < 0) {
-        perror("SO_BINDTODEVICE");
-    }
-    int one = 1;
+        int one = 1;
     setsockopt(sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
     sockaddr_in dst{};
     dst.sin_family = AF_INET;
