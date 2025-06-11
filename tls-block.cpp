@@ -15,6 +15,10 @@
 using namespace std;
 
 typedef unsigned short u16;
+void usage() {
+    printf("syntax : tls-block <interface> <server_name>\n"); 
+    printf("sample : tls-block wlan0 naver.com\n"); 
+}
 static u16 checksum(u16* buf, int len) {
     unsigned long sum = 0;
     while (len > 1) { sum += *buf++; len -= 2; }
