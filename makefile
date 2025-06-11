@@ -3,7 +3,7 @@ CXXFLAGS  = -O2 -Wall -g -std=c++17
 LDLIBS    = -lpcap
 
 TARGET    = tls-block
-OBJS      = tls_block.o
+OBJS      = tls-block.o
 
 all: $(TARGET)
 
