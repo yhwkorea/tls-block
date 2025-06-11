@@ -17,263 +17,252 @@ using namespace std;
 typedef unsigned short u16;
 
 void usage() {
-    cout << "syntax : tls-block <interface> <server_name>\n";
-    cout << "sample  : tls-block wlan0 naver.com\n";
+    printf("syntax : tls-block <interface> <server_name>\n");
+    printf("sample : tls-block wlan0 naver.com\n");
 }
 
-static u16 checksum(uint16_t* buf, int len) {
-    uint32_t sum = 0;
-    while (len > 1) {
-        sum += *buf++;
-        len -= 2;
-    }
-    if (len == 1) sum += *(uint8_t*)buf;
+static u16 checksum(u16* buf, int len) {
+    unsigned long sum = 0;
+    while (len > 1) { sum += *buf++; len -= 2; }
+    if (len == 1) sum += *(unsigned char*)buf;
     sum = (sum >> 16) + (sum & 0xFFFF);
     sum += (sum >> 16);
     return (u16)(~sum);
 }
 
 // Parse SNI from single-record TLS ClientHello
-static string parse_sni(const uint8_t* payload_data, size_t payload_len) {
-    if (payload_len < 5 || payload_data[0] != 0x16) return "";
-    uint16_t record_len = (payload_data[3] << 8) | payload_data[4];
-    if (payload_len < (size_t)5 + record_len) return "";
-    size_t offset = 5;
-    if (offset + 4 > payload_len || payload_data[offset] != 0x01) return "";
-    uint32_t hs_len = (payload_data[offset+1]<<16)
-                    | (payload_data[offset+2]<<8)
-                    |  payload_data[offset+3];
-    offset += 4;
-    if (offset + hs_len > payload_len) return "";
-    offset += 2 + 32;  // version + random
-    if (offset >= payload_len) return "";
-    uint8_t sid_len = payload_data[offset++];
-    offset += sid_len;
-    if (offset + 2 > payload_len) return "";
-    uint16_t cs_len = (payload_data[offset]<<8)|payload_data[offset+1];
-    offset += 2 + cs_len;
-    if (offset >= payload_len) return "";
-    uint8_t comp_len = payload_data[offset++];
-    offset += comp_len;
-    if (offset + 2 > payload_len) return "";
-    uint16_t ext_total = (payload_data[offset]<<8)|payload_data[offset+1];
-    offset += 2;
-    size_t end_of_ext = offset + ext_total;
-    // https://img1.daumcdn.net/thumb/R1280x0/?scode=mtistory2&fname=https%3A%2F%2Fblog.kakaocdn.net%2Fdn%2FI5TLu%2FbtrBRoSgSI2%2FVRgHO2rNOljLsP9IsAYwaK%2Fimg.jpg
-    while (offset + 4 <= end_of_ext && offset + 4 <= payload_len) {
-        uint16_t ext_type = (payload_data[offset]<<8)|payload_data[offset+1];
-        uint16_t ext_len  = (payload_data[offset+2]<<8)|payload_data[offset+3];
-        offset += 4;
-        if (ext_type == 0x0000 && offset + ext_len <= end_of_ext) {
-            offset += 3; // skip list length + name type
-            uint16_t name_len = (payload_data[offset]<<8)|payload_data[offset+1];
-            offset += 2;
-            if (offset + name_len <= end_of_ext) {
-                return string((char*)(payload_data + offset), name_len);
-            } else {
+static string parse_sni(const uint8_t* data, size_t len) {
+    if (len < 5 || data[0] != 0x16) return "";
+    uint16_t rec_len = (data[3] << 8) | data[4];
+    if (len < (size_t)5 + rec_len) return "";
+    size_t pos = 5;
+    if (pos + 4 > len || data[pos] != 0x01) return "";
+    uint32_t hs_len = (data[pos+1]<<16)|(data[pos+2]<<8)|data[pos+3];
+    pos += 4;
+    if (pos + hs_len > len) return "";
+    pos += 2 + 32; // version + random
+    if (pos >= len) return "";
+    uint8_t sid_len = data[pos++]; pos += sid_len;
+    if (pos + 2 > len) return "";
+    uint16_t cs_len = (data[pos]<<8)|data[pos+1]; pos += 2 + cs_len;
+    if (pos >= len) return "";
+    uint8_t comp_len = data[pos++]; pos += comp_len;
+    if (pos + 2 > len) return "";
+    uint16_t ext_total = (data[pos]<<8)|data[pos+1]; pos += 2;
+    size_t end_ext = pos + ext_total;
+    while (pos + 4 <= end_ext && pos + 4 <= len) {
+        uint16_t t = (data[pos]<<8)|data[pos+1];
+        uint16_t l = (data[pos+2]<<8)|data[pos+3]; pos += 4;
+        if (t == 0x0000 && pos + l <= end_ext) {
+            pos += 2 + 1; // list length + name type
+            uint16_t name_len = (data[pos]<<8)|data[pos+1]; pos += 2;
+            if (pos + name_len <= end_ext)
+                return string((char*)(data + pos), name_len);
+            else
                 return "";
-            }
         }
-        offset += ext_len;
+        pos += l;
     }
     return "";
 }
 
 struct FlowKey {
-    uint32_t src_ip, dst_ip;
-    uint16_t src_port, dst_port;
+    uint32_t src, dst;
+    uint16_t sport, dport;
     bool operator==(const FlowKey& o) const {
-        return src_ip==o.src_ip && dst_ip==o.dst_ip
-            && src_port==o.src_port && dst_port==o.dst_port;
+        return src==o.src && dst==o.dst && sport==o.sport && dport==o.dport;
     }
 };
 
 struct FlowKeyHash {
     size_t operator()(FlowKey const& k) const noexcept {
-        return k.src_ip ^ (k.dst_ip<<1)
-             ^ ((size_t)k.src_port<<16) ^ ((size_t)k.dst_port<<1);
+        return k.src ^ (k.dst<<1) ^ ((size_t)k.sport<<16) ^ ((size_t)k.dport<<1);
     }
 };
 
 struct Reassembly {
     uint32_t base_seq{};
-    size_t   expected_len{};
-    vector<uint8_t> buffer;
-    bool     in_progress{};
+    size_t expected_len{};
+    vector<uint8_t> buf;
+    bool in_progress{};
 };
 
-// 고정 크기 전송 버퍼
-static u_char send_buffer[1500];
+// Fixed-size buffer for injection
+static u_char outbuf[1500];
 
-// 서버 방향 RST+ACK 주입 (pcap)
-static void send_rst_to_server(pcap_t* pc,
-    const u_char* orig_packet,
-    const iphdr* ip_hdr_orig,
-    const tcphdr* tcp_hdr_orig,
-    int payload_len,
-    const uint8_t mac_addr[6])
-{
-    int ether_header_size = sizeof(ether_header);
-    int ip_header_len     = ip_hdr_orig->ihl * 4;
-    int tcp_header_len    = tcp_hdr_orig->th_off * 4;
-    int packet_size       = ether_header_size + ip_header_len + tcp_header_len;
+// Forward injection via pcap: full Ethernet frame
+static void inject_forward_rst(pcap_t* handle,
+    const u_char* orig,
+    const iphdr* iph_orig,
+    const tcphdr* tcph_orig,
+    int data_len,
+    const uint8_t mac[6]) {
+    int eth_sz = sizeof(ether_header);
+    int ip_sz  = iph_orig->ihl * 4;
+    int tcp_sz = tcph_orig->th_off * 4;
+    int pkt_sz = eth_sz + ip_sz + tcp_sz;
 
-    memcpy(send_buffer, orig_packet, packet_size);
-    auto* eth = (ether_header*)send_buffer;
-    memcpy(eth->ether_shost, mac_addr, 6);
+    memcpy(outbuf, orig, pkt_sz);
+    auto* eth = (ether_header*)outbuf;
+    memcpy(eth->ether_shost, mac, 6);
 
-    auto* new_ip = (iphdr*)(send_buffer + ether_header_size);
-    new_ip->tot_len = htons(ip_header_len + tcp_header_len);
-    new_ip->check   = 0;
-    new_ip->check   = checksum((u16*)new_ip, ip_header_len);
+    auto* iph = (iphdr*)(outbuf + eth_sz);
+    iph->tot_len = htons(ip_sz + tcp_sz);
+    iph->check = 0;
+    iph->check = checksum((u16*)iph, ip_sz);
 
-    auto* new_tcp = (tcphdr*)(send_buffer + ether_header_size + ip_header_len);
-    new_tcp->seq     = htonl(ntohl(tcp_hdr_orig->seq) + payload_len);
-    new_tcp->ack_seq = tcp_hdr_orig->ack_seq;
-    new_tcp->rst     = 1;
-    new_tcp->ack     = 1;
-    new_tcp->th_off  = tcp_header_len / 4;
-    new_tcp->check   = 0;
+    auto* tcph = (tcphdr*)(outbuf + eth_sz + ip_sz);
+    tcph->seq = htonl(ntohl(tcph_orig->seq) + data_len);
+    tcph->ack_seq = tcph_orig->ack_seq;
+    tcph->rst = 1;
+    tcph->ack = 1;
+    tcph->th_off = tcp_sz/4;
+    tcph->check = 0;
 
-    struct {
-        uint32_t src, dst;
-        uint8_t  zero, proto;
-        uint16_t len;
-    } pseudo_hdr = {
-        new_ip->saddr,
-        new_ip->daddr,
-        0,
-        IPPROTO_TCP,
-        htons(tcp_header_len)
-    };
+    struct { uint32_t src,dst; uint8_t zero,proto; uint16_t len; } pseudo;
+    pseudo.src = iph->saddr;
+    pseudo.dst = iph->daddr;
+    pseudo.zero = 0;
+    pseudo.proto = IPPROTO_TCP;
+    pseudo.len = htons(tcp_sz);
 
-    vector<u_char> chk_buf(sizeof(pseudo_hdr) + tcp_header_len);
-    memcpy(chk_buf.data(), &pseudo_hdr, sizeof(pseudo_hdr));
-    memcpy(chk_buf.data() + sizeof(pseudo_hdr), new_tcp, tcp_header_len);
-    new_tcp->check = checksum((u16*)chk_buf.data(), chk_buf.size());
+    vector<u_char> buf2(sizeof(pseudo) + tcp_sz);
+    memcpy(buf2.data(), &pseudo, sizeof(pseudo));
+    memcpy(buf2.data()+sizeof(pseudo), tcph, tcp_sz);
+    tcph->check = checksum((u16*)buf2.data(), buf2.size());
 
-    pcap_sendpacket(pc, send_buffer, packet_size);
+    pcap_sendpacket(handle, outbuf, pkt_sz);
 }
 
-// 클라이언트 방향 RST+ACK 주입 (raw socket)
-static void send_rst_to_client(const iphdr* ip_hdr_orig,
-    const tcphdr* tcp_hdr_orig,
-    int payload_len)
-{
-    int ip_header_len  = ip_hdr_orig->ihl * 4;
-    int tcp_header_len = tcp_hdr_orig->th_off * 4;
-    int packet_size    = ip_header_len + tcp_header_len;
+// Backward injection via raw socket: IP/TCP only
+static void inject_backward_rst(const iphdr* iph_orig,
+    const tcphdr* tcph_orig,
+    int data_len) {
+    int ip_sz = iph_orig->ihl *4;
+    int tcp_sz = tcph_orig->th_off *4;
+    int pkt_sz = ip_sz + tcp_sz;
 
-    vector<u_char> pkt(packet_size);
-    memcpy(pkt.data(), ip_hdr_orig,  ip_header_len);
-    memcpy(pkt.data()+ip_header_len, tcp_hdr_orig, tcp_header_len);
+    vector<u_char> pkt(pkt_sz);
+    memcpy(pkt.data(), iph_orig, ip_sz);
+    memcpy(pkt.data()+ip_sz, tcph_orig, tcp_sz);
 
-    auto* new_ip = (iphdr*)pkt.data();
-    new_ip->saddr   = ip_hdr_orig->daddr;
-    new_ip->daddr   = ip_hdr_orig->saddr;
-    new_ip->tot_len = htons(packet_size);
-    new_ip->check   = 0;
-    new_ip->check   = checksum((u16*)new_ip, ip_header_len);
+    auto* iph = (iphdr*)pkt.data();
+    iph->saddr = iph_orig->daddr;
+    iph->daddr = iph_orig->saddr;
+    iph->tot_len = htons(pkt_sz);
+    iph->check = 0;
+    iph->check = checksum((u16*)iph, ip_sz);
 
-    auto* new_tcp = (tcphdr*)(pkt.data() + ip_header_len);
-    new_tcp->source   = tcp_hdr_orig->dest;
-    new_tcp->dest     = tcp_hdr_orig->source;
-    new_tcp->seq      = tcp_hdr_orig->ack_seq;
-    new_tcp->ack_seq  = htonl(ntohl(tcp_hdr_orig->seq) + payload_len);
-    new_tcp->rst      = 1;
-    new_tcp->ack      = 1;
-    new_tcp->th_off   = tcp_header_len / 4;
-    new_tcp->check    = 0;
+    auto* tcph = (tcphdr*)(pkt.data()+ip_sz);
+    tcph->source = tcph_orig->dest;
+    tcph->dest = tcph_orig->source;
+    tcph->seq = tcph_orig->ack_seq;
+    tcph->ack_seq = htonl(ntohl(tcph_orig->seq)+data_len);
+    tcph->rst = 1;
+    tcph->ack = 1;
+    tcph->th_off = tcp_sz/4;
+    tcph->check = 0;
 
-    struct {
-        uint32_t src, dst;
-        uint8_t  zero, proto;
-        uint16_t len;
-    } pseudo_hdr = {
-        new_ip->saddr,
-        new_ip->daddr,
-        0,
-        IPPROTO_TCP,
-        htons(tcp_header_len)
-    };
+    struct { uint32_t src,dst; uint8_t zero,proto; uint16_t len; } pseudo;
+    pseudo.src = iph->saddr;
+    pseudo.dst = iph->daddr;
+    pseudo.zero = 0;
+    pseudo.proto = IPPROTO_TCP;
+    pseudo.len = htons(tcp_sz);
+    vector<u_char> buf2(sizeof(pseudo)+tcp_sz);
+    memcpy(buf2.data(), &pseudo, sizeof(pseudo));
+    memcpy(buf2.data()+sizeof(pseudo), tcph, tcp_sz);
+    tcph->check = checksum((u16*)buf2.data(), buf2.size());
 
-    vector<u_char> chk_buf(sizeof(pseudo_hdr) + tcp_header_len);
-    memcpy(chk_buf.data(), &pseudo_hdr, sizeof(pseudo_hdr));
-    memcpy(chk_buf.data() + sizeof(pseudo_hdr), new_tcp, tcp_header_len);
-    new_tcp->check = checksum((u16*)chk_buf.data(), chk_buf.size());
-
-    int raw_sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
-    int on = 1;
-    setsockopt(raw_sock, IPPROTO_IP, IP_HDRINCL, &on, sizeof(on));
-
-    sockaddr_in dst_addr{};
-    dst_addr.sin_family      = AF_INET;
-    dst_addr.sin_addr.s_addr = new_ip->daddr;
-    sendto(raw_sock, pkt.data(), packet_size, 0,
-           (sockaddr*)&dst_addr, sizeof(dst_addr));
-    close(raw_sock);
+    int sd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    int one=1; setsockopt(sd, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
+    sockaddr_in dst{}; dst.sin_family=AF_INET; dst.sin_addr.s_addr=iph->daddr;
+    sendto(sd, pkt.data(), pkt_sz, 0, (sockaddr*)&dst, sizeof(dst));
+    close(sd);
 }
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
-        usage();
-        return 1;
-    }
-    char* interface = argv[1];
-    string pattern = argv[2];
+    if (argc!=3) { usage(); return 1; }
+    char* dev = argv[1];
+    string pat = argv[2];
     char errbuf[PCAP_ERRBUF_SIZE];
-    pcap_t* pc = pcap_open_live(interface, 65535, 1, 1, errbuf);
-    if (!pc) {
-        cerr << "Error opening " << interface << ": " << errbuf << "\n";
-        return 1;
-    }
-    pcap_set_immediate_mode(pc, 1);
+    pcap_t* handle = pcap_open_live(dev, 65535, 1, 1, errbuf);
+    if (!handle) { cerr << errbuf << "\n"; return 1; }
+    pcap_set_immediate_mode(handle, 1);
+    struct bpf_program fp;
+    pcap_compile(handle, &fp, "tcp dst port 443", 1, PCAP_NETMASK_UNKNOWN);
+    pcap_setfilter(handle, &fp);
 
-    // MAC 주소 조회
-    uint8_t mac_addr[6];
-    int sock_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    ifreq iface_req{};
-    strncpy(iface_req.ifr_name, interface, IFNAMSIZ-1);
-    ioctl(sock_fd, SIOCGIFHWADDR, &iface_req);
-    memcpy(mac_addr, iface_req.ifr_hwaddr.sa_data, 6);
-    close(sock_fd);
+    // get MAC
+    uint8_t mac[6];
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    struct ifreq ifr{};
+    strncpy(ifr.ifr_name, dev, IFNAMSIZ-1);
+    ioctl(fd, SIOCGIFHWADDR, &ifr);
+    memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
+    close(fd);
 
-    unordered_map<FlowKey, Reassembly, FlowKeyHash> flow_map;
-    flow_map.reserve(1024);
+    unordered_map<FlowKey, Reassembly, FlowKeyHash> flows;
+    flows.reserve(1024);
 
     while (true) {
-        pcap_pkthdr* header;
-        const u_char* packet;
-        if (pcap_next_ex(pc, &header, &packet) <= 0) continue;
+        pcap_pkthdr* hdr;
+        const u_char* pkt;
+        if (pcap_next_ex(handle, &hdr, &pkt) <= 0) continue;
+        auto* eth = (ether_header*)pkt;
+        if (ntohs(eth->ether_type) != ETH_P_IP) continue;
+        auto* iph = (iphdr*)(pkt + sizeof(ether_header));
+        if (iph->protocol != IPPROTO_TCP) continue;
+        int ip_len = iph->ihl * 4;
+        auto* tcph = (tcphdr*)(pkt + sizeof(ether_header) + ip_len);
+        int tcp_len = tcph->th_off * 4;
+        int dlen = ntohs(iph->tot_len) - ip_len - tcp_len;
+        if (dlen <= 0) continue;
+        const uint8_t* data = (uint8_t*)tcph + tcp_len;
 
-        auto* eth_hdr = (ether_header*)packet;
-        if (ntohs(eth_hdr->ether_type) != ETH_P_IP) continue;
+        FlowKey key{iph->saddr, iph->daddr, ntohs(tcph->source), ntohs(tcph->dest)};
+        auto& r = flows[key];
+        uint32_t seq = ntohl(tcph->seq);
 
-        auto* ip_hdr = (iphdr*)(packet + sizeof(ether_header));
-        if (ip_hdr->protocol != IPPROTO_TCP) continue;
-
-        int ip_header_len = ip_hdr->ihl * 4;
-        auto* tcp_hdr = (tcphdr*)(packet + sizeof(ether_header) + ip_header_len);
-        int tcp_header_len = tcp_hdr->th_off * 4;
-        int payload_len = ntohs(ip_hdr->tot_len) - ip_header_len - tcp_header_len;
-        if (payload_len <= 0) continue;
-
-        const uint8_t* payload_data = (uint8_t*)tcp_hdr + tcp_header_len;
-        FlowKey conn_key{ip_hdr->saddr, ip_hdr->daddr,
-                         ntohs(tcp_hdr->source), ntohs(tcp_hdr->dest)};
-        auto& reassembler = flow_map[conn_key];
-        uint32_t seq_num = ntohl(tcp_hdr->seq);
-
-        if (!reassembler.in_progress) {
-            string host = parse_sni(payload_data, payload_len);
-            if (!host.empty() && host.find(pattern) != string::npos) {
-                send_rst_to_server(pc, packet, ip_hdr, tcp_hdr, payload_len, mac_addr);
-                send_rst_to_client(ip_hdr, tcp_hdr, payload_len);
-                cout << "[+] Blocked: " << host << "\n";
+        if (!r.in_progress) {
+            // single-packet SNI
+            string sni = parse_sni(data, dlen);
+            if (!sni.empty() && sni.find(pat) != string::npos) {
+                inject_forward_rst(handle, pkt, iph, tcph, dlen, mac);
+                inject_backward_rst(iph, tcph, dlen);
+                cout << "[+] Blocked: " << sni << "\n";
+                continue;
             }
-
+            // start reassembly
+            if (dlen >= 5 && data[0] == 0x16) {
+                uint16_t rec = (data[3]<<8)|data[4];
+                r.base_seq = seq;
+                r.expected_len = 5 + rec;
+                r.buf.clear();
+                r.buf.reserve(r.expected_len);
+                r.buf.insert(r.buf.end(), data, data + dlen);
+                r.in_progress = true;
+            }
+        } else {
+            // continue reassembly
+            if (seq >= r.base_seq && seq < r.base_seq + r.expected_len) {
+                size_t off = seq - r.base_seq;
+                if (r.buf.size() < off + dlen) r.buf.resize(off + dlen);
+                memcpy(r.buf.data() + off, data, dlen);
+                if (r.buf.size() >= r.expected_len) {
+                    string sni = parse_sni(r.buf.data(), r.buf.size());
+                    flows.erase(key);
+                    if (!sni.empty() && sni.find(pat) != string::npos) {
+                        inject_forward_rst(handle, pkt, iph, tcph, r.expected_len, mac);
+                        inject_backward_rst(iph, tcph, r.expected_len);
+                        cout << "[+] Reassembled & Blocked: " << sni << "\n";
+                    }
+                }
+            } else {
+                flows.erase(key);
+            }
         }
     }
-    pcap_close(pc);
+    pcap_close(handle);
     return 0;
 }
