@@ -168,7 +168,7 @@ static void inject_backward_rst(const iphdr* iph_orig,
 }
 
 int main(int argc, char** argv) {
-    if (argc!=3) { cerr<<"usage: tls-block <iface> <pattern>\n"; return 1; }
+    if (argc!=3) { usage(); return 1; }
     char* dev=argv[1]; string pat=argv[2];
     char ebuf[PCAP_ERRBUF_SIZE];
     pcap_t* handle=pcap_open_live(dev,65535,1,1,ebuf);
