@@ -166,10 +166,10 @@ int main(int argc, char* argv[]) {
         auto* eth = (ether_header*)pkt; if (ntohs(eth->ether_type)!=ETH_P_IP) continue;
         auto* iph = (iphdr*)(pkt+sizeof(ether_header)); if (iph->protocol!=IPPROTO_TCP) continue;
         int ip_len = iph->ihl*4;
-        auto* tcph = (tcphdr*)(pkt+sizeof(ethernet_header)+ip_len);
+        auto* tcph = (tcphdr*)(pkt+sizeof(ether_header)+ip_len);
         int tcp_len = tcph->th_off*4;
         int dlen = ntohs(iph->tot_len)-ip_len-tcp_len; if (dlen<=0) continue;
-        const uint8_t* data = pkt+sizeof(ethernet_header)+ip_len+tcp_len;
+        const uint8_t* data = pkt+sizeof(ether_header)+ip_len+tcp_len;
 
         Flow f{iph->saddr, iph->daddr, ntohs(tcph->source), ntohs(tcph->dest)};
         auto& r = flows[f]; uint32_t seq = ntohl(tcph->seq);
