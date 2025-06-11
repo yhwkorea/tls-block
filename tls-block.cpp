@@ -44,14 +44,27 @@ void send_rst(const iphdr* ip_hdr, const tcphdr* tcp_hdr, int data_len, const ch
     char buf[1500] = {};
     int ip_len = sizeof(iphdr);
     int tcp_len = tcp_hdr->th_off * 4;
+
+    // Copy IP header
     iphdr* iph = (iphdr*)buf;
     memcpy(iph, ip_hdr, ip_len);
-        // IP total length and checksum
     iph->tot_len = htons(ip_len + tcp_len);
     iph->check = 0;
     iph->check = checksum((u16*)iph, ip_len);
 
-    // Compute TCP pseudo-header checksum
+    // Copy TCP header + options
+    tcphdr* tcph = (tcphdr*)(buf + ip_len);
+    memcpy(tcph, tcp_hdr, tcp_len);
+    uint32_t orig_seq = ntohl(tcp_hdr->th_seq);
+    uint32_t orig_ack = ntohl(tcp_hdr->th_ack);
+    // Set RST sequence/ack according to RFC 793
+    tcph->th_seq   = htonl(orig_ack);
+    tcph->th_ack   = htonl(orig_seq + data_len);
+    tcph->th_flags = TH_RST | TH_ACK;
+    tcph->th_off   = tcp_len / 4;
+    tcph->th_sum   = 0;
+
+    // Build pseudo-header for checksum
     struct {
         uint32_t src, dst;
         uint8_t zero, proto;
@@ -68,8 +81,8 @@ void send_rst(const iphdr* ip_hdr, const tcphdr* tcp_hdr, int data_len, const ch
     memcpy(tmp + sizeof(pseudo), tcph, tcp_len);
     tcph->th_sum = checksum((u16*)tmp, sizeof(pseudo) + tcp_len);
 
-    // Send via raw socket bound to interface
-    in_addr dst_ip;
+    // Send packet bound to interface
+    in_addr dst_ip{};
     dst_ip.s_addr = iph->daddr;
     send_packet(buf, ip_len + tcp_len, dst_ip, dev);
 }
