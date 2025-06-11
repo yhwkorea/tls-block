@@ -270,7 +270,7 @@ int main(int argc, char** argv) {
                 send_rst_to_server(pc, packet, ip_hdr, tcp_hdr, payload_len, mac_addr);
                 send_rst_to_client(ip_hdr, tcp_hdr, payload_len);
                 cout << "[+] Blocked: " << host << "\n";
-                `}`
+            }
 
         }
     }
