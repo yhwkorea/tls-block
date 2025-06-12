@@ -31,6 +31,7 @@ static u16 checksum(u16* buf, int len) {
 }
 
 // Parse SNI from single-record TLS ClientHello
+// https://img1.daumcdn.net/thumb/R1280x0/?scode=mtistory2&fname=https%3A%2F%2Fblog.kakaocdn.net%2Fdn%2FI5TLu%2FbtrBRoSgSI2%2FVRgHO2rNOljLsP9IsAYwaK%2Fimg.jpg
 static string parse_sni(const uint8_t* data, size_t len) {
     if (len < 5 || data[0] != 0x16) return "";
     uint16_t rec_len = (data[3] << 8) | data[4];
